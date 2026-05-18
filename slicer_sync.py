@@ -3,10 +3,11 @@
 and selectively mirror Creality's values across.
 
 Two modes:
-  Batch (no --name): walks every user printer profile + every filament profile
-    that applies to the configured printer model. Per-profile prompts let you
-    apply all / inspect field-by-field / skip / quit. Use --skip-printer or
-    --skip-filament to limit scope.
+  Batch (no --name): walks every user printer profile, every filament profile
+    that applies to the configured printer model, and every process (print
+    quality) profile tagged to the configured printer. Per-profile prompts let
+    you apply all / inspect field-by-field / skip / quit. Use --skip-printer,
+    --skip-filament, or --skip-process to limit scope.
   Single (--name X): processes just that profile, type inferred or set by --type.
 
 Per-profile flow:
@@ -18,9 +19,9 @@ Per-profile flow:
   5. Dated backup of every target file before writing.
 
 Examples:
-  ./slicer_sync.py                                        # batch: printer + filaments
-  ./slicer_sync.py --skip-filament                        # batch: printer only
-  ./slicer_sync.py --skip-printer                         # batch: filaments only
+  ./slicer_sync.py                                        # batch: printer + filaments + processes
+  ./slicer_sync.py --skip-filament --skip-process         # batch: printer only
+  ./slicer_sync.py --type process --preview-only          # dry-look at every process profile
   ./slicer_sync.py --list                                 # list available presets
   ./slicer_sync.py --name "Creality K2 Pro 0.4 nozzle - Sam"   # single profile
   ./slicer_sync.py --type filament --name "Creality Generic PLA @K2-all"
@@ -137,6 +138,19 @@ FILAMENT_PROTECTED_FIELDS = {
     "filament_settings_id": "filament preset identity",
     "filament_notes": "user notes field",
     "default_filament_colour": "cosmetic colour",
+}
+
+# Process-specific protected fields (only checked when --type process).
+# Identity + extruder bindings. Process profiles also routinely contain a lot
+# of user-tuned values (speeds, densities, wall generator, etc.) -- those are
+# NOT protected here; they show up in the diff so you can review per-field
+# rather than have the script silently keep or overwrite them.
+PROCESS_PROTECTED_FIELDS = {
+    "print_settings_id": "process preset identity",
+    "print_extruder_id": "extruder binding",
+    "print_extruder_variant": "extruder variant binding",
+    "compatible_printers": "printer scope",
+    "compatible_printers_condition": "printer scope expression",
 }
 
 GREEN = "\033[32m"
@@ -266,6 +280,8 @@ def categorise(field: str, orca_value: Any, profile_type: str = "machine") -> st
         return "identity"
     if profile_type == "filament" and field in FILAMENT_PROTECTED_FIELDS:
         return FILAMENT_PROTECTED_FIELDS[field]
+    if profile_type == "process" and field in PROCESS_PROTECTED_FIELDS:
+        return PROCESS_PROTECTED_FIELDS[field]
     if profile_type == "machine":
         if field in USER_FIELDS:
             return "user-specific"
@@ -290,6 +306,29 @@ def cp_filament_name_for(orca_name: str, printer_model: str, nozzle: str) -> str
     if base.startswith(ORCA_BRAND_PREFIX):
         base = base[len(ORCA_BRAND_PREFIX):]
     return f"{base} @{printer_model} {nozzle} nozzle"
+
+
+def cp_process_name_for(orca_name: str) -> str:
+    """Map an Orca process profile name to the matching Creality Print name.
+
+    Orca uses varied descriptors per layer height (Detail / Optimal / Standard
+    / Draft / SuperDraft) while CP labels them all 'Standard'. The layer-height
+    prefix ('0.16mm', '0.20mm', etc.) and the '@<printer> <nozzle> nozzle'
+    suffix are stable across both. We strip any user suffix (' - Sam'), then
+    rebuild as '<height> Standard <@suffix>'.
+
+    Examples:
+      '0.16mm Optimal @Creality K2 Pro 0.4 nozzle - Sam'
+        -> '0.16mm Standard @Creality K2 Pro 0.4 nozzle'
+      '0.20mm Standard @Creality K2 Pro 0.4 nozzle'
+        -> '0.20mm Standard @Creality K2 Pro 0.4 nozzle' (no change)
+    """
+    base = orca_name.split(" - ", 1)[0] if " - " in orca_name else orca_name
+    if " " not in base or "@" not in base:
+        return base
+    height, rest = base.split(" ", 1)
+    suffix = "@" + rest.split("@", 1)[1]
+    return f"{height} Standard {suffix}"
 
 
 def is_noise_diff(field: str, ov: Any, cv: Any) -> str | None:
@@ -415,6 +454,25 @@ def discover_user_printer_profiles() -> list[str]:
     return sorted(names)
 
 
+def discover_user_process_profiles() -> list[str]:
+    """Every user process profile whose name contains '@<CP_PRINTER_MODEL>'.
+    Catches all nozzle variants for the configured printer family."""
+    names: set[str] = set()
+    if not OS_USER.exists():
+        return []
+    pattern = f"@{CP_PRINTER_MODEL}"
+    for sub in sorted(OS_USER.iterdir()):
+        if not sub.is_dir():
+            continue
+        process_dir = sub / "process"
+        if not process_dir.exists():
+            continue
+        for f in process_dir.glob("*.json"):
+            if pattern in f.stem:
+                names.add(f.stem)
+    return sorted(names)
+
+
 def discover_relevant_filaments(printer_profile_path: Path) -> list[str]:
     """Read the printer's model file `default_materials` field for the canonical
     list of filaments that apply. Falls back to globbing bundled filaments
@@ -487,6 +545,7 @@ def run(args: argparse.Namespace) -> int:
         list_presets(args.type or "machine")
         if not args.type:
             list_presets("filament")
+            list_presets("process")
         return 0
 
     # Single-profile mode: --name given.
@@ -494,7 +553,7 @@ def run(args: argparse.Namespace) -> int:
         code, _ = process_profile(args, args.type or "machine", args.name, batch_mode=False)
         return code
 
-    # Batch mode: walk printers then filaments.
+    # Batch mode: walk printers, filaments, then processes.
     if not args.dry_run and is_orca_running():
         print(c("WARNING: OrcaSlicer appears to be running.", RED))
         print("If it's open, it may overwrite your edits on exit. Quit it first.")
@@ -504,8 +563,9 @@ def run(args: argparse.Namespace) -> int:
 
     did_any = False
     # --type narrows batch mode just like the explicit --skip-* flags.
-    skip_printer = args.skip_printer or args.type == "filament"
-    skip_filament = args.skip_filament or args.type == "machine"
+    skip_printer = args.skip_printer or (args.type and args.type != "machine")
+    skip_filament = args.skip_filament or (args.type and args.type != "filament")
+    skip_process = args.skip_process or (args.type and args.type != "process")
 
     if not skip_printer:
         printer_names = filter_batch_names(discover_user_printer_profiles(), "printer")
@@ -551,8 +611,21 @@ def run(args: argparse.Namespace) -> int:
                 if quit_batch:
                     return 0
 
+    if not skip_process:
+        process_names = filter_batch_names(discover_user_process_profiles(), "process")
+        if not process_names:
+            print(c("No user process profiles found for the configured printer; skipping process batch.", DIM))
+        for i, name in enumerate(process_names, 1):
+            print(c(f"\n{'='*70}", BOLD))
+            print(c(f"[process {i}/{len(process_names)}] {name}", BOLD))
+            print(c("="*70, BOLD))
+            code, quit_batch = process_profile(args, "process", name, batch_mode=True)
+            did_any = True
+            if quit_batch:
+                return 0
+
     if not did_any:
-        print(c("\nNothing to do (both --skip-printer and --skip-filament passed?).", YELLOW))
+        print(c("\nNothing to do (all --skip-* flags passed?).", YELLOW))
         return 1
 
     return 0
@@ -593,6 +666,8 @@ def process_profile(args: argparse.Namespace, profile_type: str, name: str, batc
         cp_name = args.cp_name
     elif profile_type == "filament":
         cp_name = cp_filament_name_for(name, args.cp_printer_model, args.cp_nozzle)
+    elif profile_type == "process":
+        cp_name = cp_process_name_for(name)
     else:
         cp_name = user_data.get("inherits") or name
     cp_path = find_cp_preset(profile_type, cp_name)
@@ -788,21 +863,26 @@ def main() -> int:
     )
     p.add_argument(
         "--type",
-        choices=["machine", "filament"],
+        choices=["machine", "filament", "process"],
         default=None,
         help="Profile type for single-profile mode (default: machine when --name given). "
-        "Ignored in batch mode.",
+        "In batch mode, narrows to just that type (equivalent to passing the other --skip-* flags).",
     )
     p.add_argument("--list", action="store_true", help="List available presets and exit")
     p.add_argument(
         "--skip-printer",
         action="store_true",
-        help="Batch mode: skip printer profiles, do filaments only.",
+        help="Batch mode: skip printer profiles.",
     )
     p.add_argument(
         "--skip-filament",
         action="store_true",
-        help="Batch mode: skip filament profiles, do printer only.",
+        help="Batch mode: skip filament profiles.",
+    )
+    p.add_argument(
+        "--skip-process",
+        action="store_true",
+        help="Batch mode: skip process (print quality) profiles.",
     )
     p.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
     p.add_argument(
