@@ -2,21 +2,34 @@
 """slicer_sync: compare Creality Print profiles against OrcaSlicer user presets
 and selectively mirror Creality's values across.
 
-Default flow:
-  1. Locate the named OrcaSlicer user preset (in user/default/ and user/<UUID>/).
-  2. Read its `inherits` field to find the matching Creality Print system preset.
-  3. Resolve full inheritance chains on both sides so the diff is apples-to-apples.
-  4. Filter out KAMP-K2, user-specific, and identity fields.
-  5. Walk the remaining diffs interactively (y / n / a / s / q).
-  6. Dated backup of every target file before writing.
+Two modes:
+  Batch (no --name): walks every user printer profile + every filament profile
+    that applies to the configured printer model. Per-profile prompts let you
+    apply all / inspect field-by-field / skip / quit. Use --skip-printer or
+    --skip-filament to limit scope.
+  Single (--name X): processes just that profile, type inferred or set by --type.
+
+Per-profile flow:
+  1. Find the OrcaSlicer user preset (default/ + <UUID>/ cloud dirs); for filaments
+     without a user override, fall back to the bundled system profile read-only.
+  2. Resolve the inheritance chain on both sides for an apples-to-apples diff.
+  3. Filter out KAMP-K2, user-specific, identity, and known-noise fields.
+  4. Interactive walk: y / n / a / s / q / d=show-full per field.
+  5. Dated backup of every target file before writing.
 
 Examples:
-  ./slicer_sync.py --list
-  ./slicer_sync.py --name "Creality K2 Pro 0.4 nozzle - Sam"
-  ./slicer_sync.py --name "Creality K2 Pro 0.4 nozzle - Sam" --dry-run
-  ./slicer_sync.py --name "Creality K2 Pro 0.4 nozzle - Sam" --auto-yes
+  ./slicer_sync.py                                        # batch: printer + filaments
+  ./slicer_sync.py --skip-filament                        # batch: printer only
+  ./slicer_sync.py --skip-printer                         # batch: filaments only
+  ./slicer_sync.py --list                                 # list available presets
+  ./slicer_sync.py --name "Creality K2 Pro 0.4 nozzle - Sam"   # single profile
+  ./slicer_sync.py --type filament --name "Creality Generic PLA @K2-all"
+  ./slicer_sync.py --preview-only                         # just show the diffs
 
-v1 supports machine (printer) profiles. Filament support is not implemented.
+Adapting to a different printer:
+  Edit the PRINTER_ANCHOR_NAMES / CP_PRINTER_MODEL / CP_NOZZLE / FILAMENT_SUFFIXES
+  / ORCA_BRAND_PREFIX constants near the top of this file. Paths to the slicer
+  data dirs (CP_SYSTEM / OS_BUNDLED / OS_USER) are also configurable there.
 """
 
 from __future__ import annotations
@@ -34,6 +47,39 @@ HOME = Path.home()
 CP_SYSTEM = HOME / "Library/Application Support/Creality/Creality Print/7.0/system/Creality"
 OS_BUNDLED = Path("/Applications/OrcaSlicer.app/Contents/Resources/profiles/Creality")
 OS_USER = HOME / "Library/Application Support/OrcaSlicer/user"
+
+# ---------------------------------------------------------------------------
+# Printer-family settings -- adjust these for your printer if not on K2 Pro.
+# ---------------------------------------------------------------------------
+
+# Batch mode anchors filament discovery on the first of these printer profiles
+# that exists. Put your user override first, bundled system name second.
+PRINTER_ANCHOR_NAMES = [
+    "Creality K2 Pro 0.4 nozzle - Sam",
+    "Creality K2 Pro 0.4 nozzle",
+]
+
+# Used in filament mode to derive the matching Creality Print filename --
+# CP filaments are named '<Material> @<CP_PRINTER_MODEL> <CP_NOZZLE> nozzle'.
+# Also the default for --cp-printer-model / --cp-nozzle CLI flags.
+CP_PRINTER_MODEL = "Creality K2 Pro"
+CP_NOZZLE = "0.4"
+
+# OrcaSlicer's per-family filament suffixes. Used by bundled-fallback
+# filament discovery (when the printer model has no default_materials list).
+FILAMENT_SUFFIXES = ("@K2-all", "@K2")
+
+# Brand prefix OrcaSlicer uses on bundled Creality filament names. Stripped
+# when deriving the matching CP name, which doesn't include it.
+ORCA_BRAND_PREFIX = "Creality "
+
+# Profile names containing any of these substrings (case-insensitive) are
+# skipped in batch mode. Useful for special-purpose profiles you never want
+# auto-synced (e.g. retraction-disabled variants, calibration profiles).
+# Single-profile mode (--name) ignores this list.
+BATCH_SKIP_PATTERNS = [
+    "NO RETRACTIONS",
+]
 
 # KAMP-K2 critical fields. machine_start_gcode is protected only when the
 # current value contains the KAMP marker, so users who've reverted KAMP can
@@ -235,14 +281,14 @@ def categorise(field: str, orca_value: Any, profile_type: str = "machine") -> st
 def cp_filament_name_for(orca_name: str, printer_model: str, nozzle: str) -> str:
     """Derive the matching Creality Print filament name from an Orca name.
 
-    Orca uses 'Creality <Material> @<family>' (one file per material, covers
-    multiple nozzles via compatible_printers). CP uses '<Material> @<printer> <nozzle> nozzle'
-    (one file per material per nozzle). Mapping strips the @<...> suffix,
-    drops the 'Creality ' brand prefix Orca adds, and appends the CP-style
-    printer/nozzle suffix."""
+    Orca uses '<ORCA_BRAND_PREFIX><Material> @<family>' (one file per material,
+    covers multiple nozzles via compatible_printers). CP uses
+    '<Material> @<printer> <nozzle> nozzle' (one file per material per nozzle).
+    Mapping strips the @<...> suffix, drops the brand prefix, and appends the
+    CP-style printer/nozzle suffix."""
     base = orca_name.split(" @", 1)[0]
-    if base.startswith("Creality "):
-        base = base[len("Creality "):]
+    if base.startswith(ORCA_BRAND_PREFIX):
+        base = base[len(ORCA_BRAND_PREFIX):]
     return f"{base} @{printer_model} {nozzle} nozzle"
 
 
@@ -353,51 +399,213 @@ def write_changes(target: Path, changes: dict[str, Any], dry_run: bool, do_backu
     print(f"  {c('wrote', GREEN)} {len(changes)} field(s) to {target}")
 
 
+def discover_user_printer_profiles() -> list[str]:
+    """Find every unique printer profile name across the user dirs."""
+    names: set[str] = set()
+    if not OS_USER.exists():
+        return []
+    for sub in sorted(OS_USER.iterdir()):
+        if not sub.is_dir():
+            continue
+        machine_dir = sub / "machine"
+        if not machine_dir.exists():
+            continue
+        for f in machine_dir.glob("*.json"):
+            names.add(f.stem)
+    return sorted(names)
+
+
+def discover_relevant_filaments(printer_profile_path: Path) -> list[str]:
+    """Read the printer's model file `default_materials` field for the canonical
+    list of filaments that apply. Falls back to globbing bundled filaments
+    matching FILAMENT_SUFFIXES if the model file isn't found or has no
+    default_materials."""
+    if not printer_profile_path.exists():
+        return []
+
+    # Walk inherits to find a profile that declares a printer_model.
+    search = [OS_BUNDLED / "machine"]
+    if OS_USER.exists():
+        for sub in OS_USER.iterdir():
+            if sub.is_dir():
+                search.append(sub / "machine")
+    resolved = resolve_inheritance(printer_profile_path, search)
+    printer_model = resolved.get("printer_model")
+    if printer_model:
+        model_file = OS_BUNDLED / "machine" / f"{printer_model}.json"
+        if model_file.exists():
+            try:
+                with open(model_file) as f:
+                    model_data = json.load(f)
+                materials = model_data.get("default_materials", "")
+                if materials:
+                    return [m.strip() for m in materials.split(";") if m.strip()]
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    # Fallback: bundled filaments matching the configured suffixes.
+    fdir = OS_BUNDLED / "filament"
+    if not fdir.exists():
+        return []
+    names: set[str] = set()
+    for suffix in FILAMENT_SUFFIXES:
+        for f in fdir.glob(f"*{suffix}.json"):
+            names.add(f.stem)
+    return sorted(names)
+
+
+def filter_batch_names(names: list[str], kind: str) -> list[str]:
+    """Drop names matching BATCH_SKIP_PATTERNS, announcing each skip."""
+    kept = []
+    for name in names:
+        matched = [p for p in BATCH_SKIP_PATTERNS if p.lower() in name.lower()]
+        if matched:
+            print(c(f"  skipping {kind} '{name}' (matches BATCH_SKIP_PATTERNS: {', '.join(matched)})", DIM))
+        else:
+            kept.append(name)
+    return kept
+
+
+def prompt_profile_action(label: str, eligible_count: int) -> str:
+    """Per-profile prompt in batch mode. Returns 'a'/'i'/'s'/'q'."""
+    print(
+        f"\n  {c(label, BOLD)}: {eligible_count} eligible diff(s). "
+        f"[{c('a', GREEN)}=apply all / {c('i', BOLD)}=inspect field-by-field / "
+        f"{c('s', YELLOW)}=skip this profile / {c('q', RED)}=quit batch]"
+    )
+    while True:
+        choice = input("  > ").strip().lower()
+        if choice in ("a", "i", "s", "q"):
+            return choice
+        if choice == "":
+            return "i"  # default to inspect
+        print(c("    invalid choice", RED))
+
+
 def run(args: argparse.Namespace) -> int:
     if args.list:
-        list_presets(args.type)
+        list_presets(args.type or "machine")
+        if not args.type:
+            list_presets("filament")
         return 0
 
+    # Single-profile mode: --name given.
+    if args.name:
+        code, _ = process_profile(args, args.type or "machine", args.name, batch_mode=False)
+        return code
+
+    # Batch mode: walk printers then filaments.
+    if not args.dry_run and is_orca_running():
+        print(c("WARNING: OrcaSlicer appears to be running.", RED))
+        print("If it's open, it may overwrite your edits on exit. Quit it first.")
+        ans = input("Continue anyway? [y/N] ").strip().lower()
+        if ans != "y":
+            return 1
+
+    did_any = False
+    # --type narrows batch mode just like the explicit --skip-* flags.
+    skip_printer = args.skip_printer or args.type == "filament"
+    skip_filament = args.skip_filament or args.type == "machine"
+
+    if not skip_printer:
+        printer_names = filter_batch_names(discover_user_printer_profiles(), "printer")
+        if not printer_names:
+            print(c("No user printer profiles found -- skipping printer batch.", DIM))
+        for i, name in enumerate(printer_names, 1):
+            print(c(f"\n{'='*70}", BOLD))
+            print(c(f"[printer {i}/{len(printer_names)}] {name}", BOLD))
+            print(c("="*70, BOLD))
+            code, quit_batch = process_profile(args, "machine", name, batch_mode=True)
+            did_any = True
+            if quit_batch:
+                return 0
+
+    if not skip_filament:
+        # Anchor filament discovery on the first PRINTER_ANCHOR_NAMES entry
+        # that exists (user override preferred, bundled system as fallback).
+        anchor_paths: list[Path] = []
+        for candidate in PRINTER_ANCHOR_NAMES:
+            anchor_paths = find_user_copies("machine", candidate)
+            if anchor_paths:
+                break
+            bundled = find_orca_system_preset("machine", candidate)
+            if bundled:
+                anchor_paths = [bundled]
+                break
+        if not anchor_paths:
+            print(c(
+                f"Couldn't find any of {PRINTER_ANCHOR_NAMES} to anchor filament "
+                "discovery; skipping filament batch.",
+                DIM,
+            ))
+        else:
+            filaments = filter_batch_names(discover_relevant_filaments(anchor_paths[0]), "filament")
+            if not filaments:
+                print(c("No filaments discovered for the K2 Pro; skipping filament batch.", DIM))
+            for i, name in enumerate(filaments, 1):
+                print(c(f"\n{'='*70}", BOLD))
+                print(c(f"[filament {i}/{len(filaments)}] {name}", BOLD))
+                print(c("="*70, BOLD))
+                code, quit_batch = process_profile(args, "filament", name, batch_mode=True)
+                did_any = True
+                if quit_batch:
+                    return 0
+
+    if not did_any:
+        print(c("\nNothing to do (both --skip-printer and --skip-filament passed?).", YELLOW))
+        return 1
+
+    return 0
+
+
+def process_profile(args: argparse.Namespace, profile_type: str, name: str, batch_mode: bool = False) -> tuple[int, bool]:
+    """Run the sync workflow for a single profile. Returns (exit_code, quit_batch)."""
     read_only = False
-    user_copies = find_user_copies(args.type, args.name)
+    user_copies = find_user_copies(profile_type, name)
     if not user_copies:
-        if args.bundled or args.type == "filament":
+        if args.bundled or profile_type == "filament":
             # Filaments rarely have user overrides; fall back to the bundled
             # system profile in read-only mode (diff only, no write).
-            bundled = find_orca_system_preset(args.type, args.name)
+            bundled = find_orca_system_preset(profile_type, name)
             if bundled:
                 user_copies = [bundled]
                 read_only = True
             else:
-                print(c(f"No preset found anywhere named '{args.name}'", RED))
-                print(c(f"Searched user dirs ({OS_USER}/<*>/{args.type}/) and bundled ({OS_BUNDLED}/{args.type}/).", DIM))
-                print(c("Run with --list to see available names.", DIM))
-                return 1
+                if not batch_mode:
+                    print(c(f"No preset found anywhere named '{name}'", RED))
+                    print(c(f"Searched user dirs ({OS_USER}/<*>/{profile_type}/) and bundled ({OS_BUNDLED}/{profile_type}/).", DIM))
+                    print(c("Run with --list to see available names.", DIM))
+                else:
+                    print(c(f"  no preset found, skipping", DIM))
+                return 1, False
         else:
-            print(c(f"No OrcaSlicer user preset found: {args.name}", RED))
-            print(c(f"Searched: {OS_USER}/<*>/{args.type}/", DIM))
+            print(c(f"No OrcaSlicer user preset found: {name}", RED))
+            print(c(f"Searched: {OS_USER}/<*>/{profile_type}/", DIM))
             print(c("Pass --bundled to compare against the bundled system profile read-only.", DIM))
             print(c("Run with --list to see available names.", DIM))
-            return 1
+            return 1, False
 
     primary = user_copies[0]
     with open(primary) as f:
         user_data = json.load(f)
 
-    if args.cp_name:
+    if args.cp_name and not batch_mode:
         cp_name = args.cp_name
-    elif args.type == "filament":
-        cp_name = cp_filament_name_for(args.name, args.cp_printer_model, args.cp_nozzle)
+    elif profile_type == "filament":
+        cp_name = cp_filament_name_for(name, args.cp_printer_model, args.cp_nozzle)
     else:
-        cp_name = user_data.get("inherits") or args.name
-    cp_path = find_cp_preset(args.type, cp_name)
+        cp_name = user_data.get("inherits") or name
+    cp_path = find_cp_preset(profile_type, cp_name)
     if not cp_path:
-        print(c(f"No Creality Print preset found: {cp_name}", RED))
-        print(c(f"Searched: {CP_SYSTEM}/{args.type}/", DIM))
-        if args.type == "filament" and not args.cp_name:
-            print(c(f"Auto-derived CP name from --name + --cp-printer-model + --cp-nozzle.", DIM))
-            print(c("Override with --cp-name if your CP filament uses a different naming convention.", DIM))
-        return 1
+        if batch_mode:
+            print(c(f"  no CP equivalent for '{cp_name}', skipping", DIM))
+        else:
+            print(c(f"No Creality Print preset found: {cp_name}", RED))
+            print(c(f"Searched: {CP_SYSTEM}/{profile_type}/", DIM))
+            if profile_type == "filament" and not args.cp_name:
+                print(c("Auto-derived CP name from --name + --cp-printer-model + --cp-nozzle.", DIM))
+                print(c("Override with --cp-name if your CP filament uses a different naming convention.", DIM))
+        return 1, False
 
     src_label = "OrcaSlicer bundled" if read_only else "OrcaSlicer user"
     print(f"{c(src_label + ' preset:', BLUE)} {primary}")
@@ -409,21 +617,21 @@ def run(args: argparse.Namespace) -> int:
     if read_only:
         print(c("  read-only: bundled OrcaSlicer profile won't be modified.", DIM))
 
-    if not args.dry_run and is_orca_running():
+    if not batch_mode and not args.dry_run and is_orca_running():
         print(c("\nWARNING: OrcaSlicer appears to be running.", RED))
         print("If it's open, it may overwrite your edits on exit. Quit it first.")
         ans = input("Continue anyway? [y/N] ").strip().lower()
         if ans != "y":
-            return 1
+            return 1, False
 
     # Inheritance search paths (parents typically live in OS_BUNDLED, but a
     # user override could theoretically introduce a parent chain too).
-    orca_search = [OS_BUNDLED / args.type]
+    orca_search = [OS_BUNDLED / profile_type]
     if OS_USER.exists():
         for sub in OS_USER.iterdir():
             if sub.is_dir():
-                orca_search.append(sub / args.type)
-    cp_search = [CP_SYSTEM / args.type]
+                orca_search.append(sub / profile_type)
+    cp_search = [CP_SYSTEM / profile_type]
 
     print(c("\nResolving inheritance...", DIM))
     orca_resolved = resolve_inheritance(primary, orca_search)
@@ -432,8 +640,8 @@ def run(args: argparse.Namespace) -> int:
 
     diffs = diff_profiles(orca_resolved, cp_resolved)
     if not diffs:
-        print(c("\nNo differences. Profiles in sync.", GREEN))
-        return 0
+        print(c("No differences. Profiles in sync.", GREEN))
+        return 0, False
 
     eligible: dict[str, tuple[str, Any, Any]] = {}
     new_only: dict[str, tuple[str, Any, Any]] = {}
@@ -445,13 +653,13 @@ def run(args: argparse.Namespace) -> int:
         if kind == "cp-missing":
             # Orca has a value CP doesn't -- usually means a KAMP/Sam-only field.
             # Categorise so KAMP entries surface in the protected list as info.
-            reason = categorise(field, ov, args.type)
+            reason = categorise(field, ov, profile_type)
             if reason:
                 protected[field] = (ov, cv, reason)
             else:
                 orca_only[field] = ov
             continue
-        reason = categorise(field, ov, args.type)
+        reason = categorise(field, ov, profile_type)
         if reason:
             protected[field] = (ov, cv, reason)
             continue
@@ -493,8 +701,8 @@ def run(args: argparse.Namespace) -> int:
             print(f"      cp:   {fmt(cv)}")
 
     if not eligible:
-        print(c("\nNothing eligible to sync.", YELLOW))
-        return 0
+        print(c("Nothing eligible to sync.", YELLOW))
+        return 0, False
 
     items = sorted(eligible.items())
 
@@ -510,12 +718,23 @@ def run(args: argparse.Namespace) -> int:
 
     if args.preview_only:
         print(c("\n--preview-only: stopping before prompts.", DIM))
-        return 0
+        return 0, False
 
     selected: dict[str, Any] = {}
     apply_remaining = args.auto_yes
-    print(f"\n{c('Stepping through prompts...', BOLD)}")
 
+    # Batch mode: whole-profile prompt before per-field walk.
+    if batch_mode and not apply_remaining:
+        label = f"{profile_type}: {name}"
+        choice = prompt_profile_action(label, len(items))
+        if choice == "s":
+            return 0, False
+        if choice == "q":
+            return 0, True
+        if choice == "a":
+            apply_remaining = True
+
+    print(f"\n{c('Stepping through prompts...', BOLD)}")
     for i, (field, (kind, ov, cv)) in enumerate(items, 1):
         if apply_remaining:
             selected[field] = cv
@@ -532,24 +751,24 @@ def run(args: argparse.Namespace) -> int:
             break
         elif choice == "q":
             print(c("\nAborted, no changes written.", YELLOW))
-            return 0
+            return 0, batch_mode  # in batch, quit signals full exit
 
     if not selected:
-        print(c("\nNothing selected. No changes made.", YELLOW))
-        return 0
+        print(c("Nothing selected. No changes made.", YELLOW))
+        return 0, False
 
     if read_only:
         print(c("\nRead-only mode: showing selected changes but not writing.", YELLOW))
         print(c("To apply, create a user override in Orca's UI (Save As) then re-run without --bundled.", DIM))
         for field, cv in selected.items():
             print(f"  would set {c(field, BOLD)} = {fmt(cv)}")
-        return 0
+        return 0, False
 
     print(f"\n{c('Applying:', BOLD)} {len(selected)} field(s) to {len(user_copies)} file(s)")
     for target in user_copies:
         write_changes(target, selected, args.dry_run, do_backup=not args.no_backup)
 
-    return 0
+    return 0, False
 
 
 def main() -> int:
@@ -557,13 +776,34 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--name", help="OrcaSlicer user preset name (no .json extension)")
+    p.add_argument(
+        "--name",
+        help="OrcaSlicer user preset name (no .json extension). If omitted, runs "
+        "batch mode: every user printer profile + every K2 Pro filament profile.",
+    )
     p.add_argument(
         "--cp-name",
-        help="Override the Creality Print preset name (default: read from user preset's 'inherits')",
+        help="Override the Creality Print preset name (single-profile mode only; "
+        "default: read from user preset's 'inherits' field, or auto-derive for filament).",
     )
-    p.add_argument("--type", choices=["machine", "filament"], default="machine")
+    p.add_argument(
+        "--type",
+        choices=["machine", "filament"],
+        default=None,
+        help="Profile type for single-profile mode (default: machine when --name given). "
+        "Ignored in batch mode.",
+    )
     p.add_argument("--list", action="store_true", help="List available presets and exit")
+    p.add_argument(
+        "--skip-printer",
+        action="store_true",
+        help="Batch mode: skip printer profiles, do filaments only.",
+    )
+    p.add_argument(
+        "--skip-filament",
+        action="store_true",
+        help="Batch mode: skip filament profiles, do printer only.",
+    )
     p.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
     p.add_argument(
         "--auto-yes",
@@ -580,13 +820,13 @@ def main() -> int:
     )
     p.add_argument(
         "--cp-printer-model",
-        default="Creality K2 Pro",
+        default=CP_PRINTER_MODEL,
         help="Printer model used to derive the CP filament name (default: %(default)s). "
         "Filament mode only.",
     )
     p.add_argument(
         "--cp-nozzle",
-        default="0.4",
+        default=CP_NOZZLE,
         help="Nozzle size used to derive the CP filament name (default: %(default)s). "
         "Filament mode only.",
     )
@@ -617,9 +857,6 @@ def main() -> int:
         "Useful for sharing the diff for review before deciding what to sync.",
     )
     args = p.parse_args()
-
-    if not args.list and not args.name:
-        p.error("--name is required unless --list is passed")
 
     try:
         return run(args)
